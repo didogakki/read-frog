@@ -600,6 +600,8 @@ options:
       description: Yüzen butona tıklandığında gerçekleştirilecek eylemi seçin
       panel: Yan paneli aç
       translate: Sayfa çevirisini aç/kapat
+      translateOtherMode: Diğer modda çevir
+      translateOtherModeDescription: Tercihi değiştirmeden geçerli sayfayı tercih edilen modun tersinde çevirir; çeviriyi kapatmak için tekrar tıklayın.
     closeMenu:
       disableForSite: Bu site için devre dışı bırak
       disableGlobally: Genel olarak devre dışı bırak

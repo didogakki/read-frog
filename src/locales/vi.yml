@@ -600,6 +600,8 @@ options:
       description: Chọn hành động khi nhấn vào nút nổi
       panel: Mở bảng điều khiển bên
       translate: Bật/tắt dịch trang
+      translateOtherMode: Dịch ở chế độ còn lại
+      translateOtherModeDescription: Dịch trang hiện tại theo chế độ ngược với tùy chọn mà không thay đổi tùy chọn; nhấn lại để tắt dịch.
     closeMenu:
       disableForSite: Tắt cho trang web này
       disableGlobally: Tắt toàn cục

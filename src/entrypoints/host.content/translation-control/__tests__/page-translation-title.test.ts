@@ -194,6 +194,7 @@ describe("pageTranslationManager title handling", () => {
       {
         enabled: true,
         url: window.location.href,
+        sessionId: expect.any(String),
       },
     )
     expect(mockSendMessage).toHaveBeenCalledWith(
@@ -201,6 +202,7 @@ describe("pageTranslationManager title handling", () => {
       {
         enabled: false,
         url: window.location.href,
+        sessionId: expect.any(String),
       },
     )
   })

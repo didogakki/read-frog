@@ -475,6 +475,87 @@ describe("floatingButton controls", () => {
       "tryToSetEnablePageTranslationOnContentScript",
       expect.objectContaining({ enabled: true }),
     )
+    expect(sendMessage).not.toHaveBeenCalledWith(
+      "toggleOtherModePageTranslationOnContentScript",
+      expect.anything(),
+    )
+  })
+
+  it("asks the manager to toggle the other mode on every click without touching the config", () => {
+    vi.useFakeTimers()
+    const { store } = renderFloatingButton({ clickAction: "translateOtherMode" })
+    const configBefore = getFloatingButtonConfig(store)
+    const mainButton = getMainButton()
+
+    for (let click = 0; click < 2; click++) {
+      fireEvent.pointerDown(mainButton, {
+        pointerId: 1,
+        pointerType: "mouse",
+        button: 0,
+        clientX: 900,
+        clientY: 500,
+      })
+      vi.advanceTimersByTime(100)
+      fireEvent.pointerUp(mainButton, {
+        pointerId: 1,
+        pointerType: "mouse",
+        button: 0,
+        clientX: 900,
+        clientY: 500,
+      })
+    }
+
+    // The decision is the manager's, so the same message goes out each time
+    // regardless of the button's own enabled/disabled view.
+    expect(sendMessage).toHaveBeenCalledTimes(2)
+    expect(sendMessage).toHaveBeenNthCalledWith(
+      1,
+      "toggleOtherModePageTranslationOnContentScript",
+      {
+        analyticsContext: expect.objectContaining({ surface: "floating_button" }),
+      },
+    )
+    expect(sendMessage).toHaveBeenNthCalledWith(
+      2,
+      "toggleOtherModePageTranslationOnContentScript",
+      {
+        analyticsContext: expect.objectContaining({ surface: "floating_button" }),
+      },
+    )
+    expect(sendMessage).not.toHaveBeenCalledWith(
+      "tryToSetEnablePageTranslationOnContentScript",
+      expect.anything(),
+    )
+    expect(getFloatingButtonConfig(store)).toEqual(configBefore)
+  })
+
+  it("does not toggle the other mode when the press turns into a drag", () => {
+    vi.useFakeTimers()
+    renderFloatingButton({ clickAction: "translateOtherMode" })
+    const mainButton = getMainButton()
+
+    fireEvent.pointerDown(mainButton, {
+      pointerId: 1,
+      pointerType: "mouse",
+      button: 0,
+      clientX: 900,
+      clientY: 500,
+    })
+    fireEvent.pointerMove(mainButton, {
+      pointerId: 1,
+      pointerType: "mouse",
+      clientX: 900,
+      clientY: 560,
+    })
+    fireEvent.pointerUp(mainButton, {
+      pointerId: 1,
+      pointerType: "mouse",
+      button: 0,
+      clientX: 900,
+      clientY: 560,
+    })
+
+    expect(sendMessage).not.toHaveBeenCalled()
   })
 
   it("turns the frog into the only visible control after a long press", () => {

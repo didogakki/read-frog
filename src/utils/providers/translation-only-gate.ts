@@ -25,6 +25,12 @@ export function providerSupportsTranslationOnlyMode(provider: string): boolean {
   return !providersWithoutMarkupSupport.has(provider)
 }
 
+/** Whether the page-translate provider cannot render translationOnly output. */
+export function isTranslationOnlyBlockedByProvider(config: Config): boolean {
+  const providerConfig = resolveProviderConfigOrNull(config, "pageTranslation")
+  return !!providerConfig && !providerSupportsTranslationOnlyMode(providerConfig.provider)
+}
+
 /**
  * The localized reason the page-translate feature cannot enter translationOnly mode,
  * or null when it can. Shared by every mode control so the wording — and the provider
@@ -38,4 +44,15 @@ export function getTranslationOnlyBlockedReason(config: Config): string | null {
   return i18n.t("options.translation.preference.translationMode.providerNotSupported", [
     PROVIDER_ITEMS[providerConfig.provider].name,
   ])
+}
+
+/**
+ * The reason to refuse new work in the mode `config` is already set to (saved
+ * preference or a temporary session override applied on top), or null. Only
+ * translationOnly can be blocked; bilingual never is.
+ */
+export function getBlockedReasonForEffectiveMode(config: Config): string | null {
+  return config.pageTranslation.mode === "translationOnly"
+    ? getTranslationOnlyBlockedReason(config)
+    : null
 }

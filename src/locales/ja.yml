@@ -600,6 +600,8 @@ options:
       description: フローティングボタンをクリックしたときの動作を選択
       panel: サイドパネルを開く
       translate: ページ翻訳を切り替え
+      translateOtherMode: 別のモードで翻訳
+      translateOtherModeDescription: 設定を変更せずに、優先モードとは逆のモードで現在のページを翻訳します。もう一度クリックすると翻訳をオフにします。
     closeMenu:
       disableForSite: このサイトで無効化
       disableGlobally: グローバルで無効化

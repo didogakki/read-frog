@@ -6,7 +6,7 @@ import type {
   BackgroundGenerateTextResponse,
 } from "@/types/background-generate-text"
 import type { Config } from "@/types/config/config"
-import type { TranslationTextFormat } from "@/types/config/translate"
+import type { TranslationMode, TranslationTextFormat } from "@/types/config/translate"
 import type {
   EdgeTTSHealthStatus,
   EdgeTTSSynthesizeRequest,
@@ -54,6 +54,13 @@ interface ProtocolMap {
   // translation state
   getEnablePageTranslationByTabId: (data: { tabId: number }) => boolean | undefined
   getEnablePageTranslationFromContentScript: () => Promise<boolean>
+  // One read of the tab's enabled flag and temporary mode (undefined = saved
+  // preference), so a restoring frame never combines two different states.
+  getPageTranslationSnapshotFromContentScript: () => Promise<{
+    enabled: boolean
+    mode?: TranslationMode
+    sessionId?: string
+  }>
   tryToSetEnablePageTranslationByTabId: (data: {
     tabId: number
     enabled: boolean
@@ -63,12 +70,31 @@ interface ProtocolMap {
     enabled: boolean
     analyticsContext?: FeatureUsageContext<"page_translation">
   }) => void
+  // Floating button "other mode" action: the top-frame manager decides between
+  // start / switch / stop against the saved preference.
+  toggleOtherModePageTranslationOnContentScript: (data: {
+    analyticsContext?: FeatureUsageContext<"page_translation">
+  }) => void
   setAndNotifyPageTranslationStateChangedByManager: (data: {
     enabled: boolean
     url?: string
     userInitiated?: boolean
+    mode?: TranslationMode
+    // Identity of the session being enabled or stopped. A stop carrying one only
+    // closes that session; without one it closes whatever the tab holds.
+    sessionId?: string
+    // The session was closed because the provider stopped supporting its mode.
+    sessionInvalidated?: boolean
   }) => void
-  notifyTranslationStateChanged: (data: { enabled: boolean }) => void
+  // A restoring top frame found the stored enabled+mode state unusable. Applied
+  // only if the tab still holds exactly that session (identity, origin and
+  // mode), so a late failure cannot clear a newer successful start.
+  closeStalePageTranslationState: (data: {
+    url?: string
+    staleMode: TranslationMode
+    sessionId?: string
+  }) => void
+  notifyTranslationStateChanged: (data: { enabled: boolean; mode?: TranslationMode }) => void
   ensureIframeHostContentInjected: (data: { tabId?: number }) => void
   injectCurrentIframesAfterTopFrameNodeTranslation: () => void
   activateSameOriginIframeSelectionRuntime: () => boolean
@@ -82,6 +108,9 @@ interface ProtocolMap {
   // ask host to start page translation
   askManagerToTogglePageTranslation: (data: {
     enabled: boolean
+    analyticsContext?: FeatureUsageContext<"page_translation">
+  }) => void
+  askManagerToToggleOtherModePageTranslation: (data: {
     analyticsContext?: FeatureUsageContext<"page_translation">
   }) => void
   openSelectionTranslationFromContextMenu: (data: { selectionText: string }) => void

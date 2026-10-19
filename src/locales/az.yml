@@ -601,6 +601,8 @@ options:
       description: Üzən düyməyə kliklədikdə icra ediləcək əməliyyatı seçin
       panel: Yan paneli aç
       translate: Səhifə tərcüməsini aktiv və ya deaktiv et
+      translateOtherMode: Digər rejimdə tərcümə et
+      translateOtherModeDescription: Üstünlük verilən rejimin əksi ilə cari səhifəni üstünlüyü dəyişmədən tərcümə edir; tərcüməni söndürmək üçün yenidən klikləyin.
     closeMenu:
       disableForSite: Bu sayt üçün deaktiv et
       disableGlobally: Hər yerdə deaktiv et

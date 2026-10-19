@@ -15,9 +15,12 @@ describe("floating button config validation", () => {
     expect(floatingButtonSideSchema.safeParse("center").success).toBe(false)
   })
 
-  it.each(["panel", "translate"])("allows the %s click action", (clickAction) => {
-    expect(floatingButtonClickActionSchema.safeParse(clickAction).success).toBe(true)
-  })
+  it.each(["panel", "translate", "translateOtherMode"])(
+    "allows the %s click action",
+    (clickAction) => {
+      expect(floatingButtonClickActionSchema.safeParse(clickAction).success).toBe(true)
+    },
+  )
 
   it("rejects unknown click actions", () => {
     expect(floatingButtonClickActionSchema.safeParse("open").success).toBe(false)

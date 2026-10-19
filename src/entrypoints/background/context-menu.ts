@@ -13,7 +13,11 @@ import { getSelectionToolbarActions } from "@/utils/custom-actions"
 import { i18n } from "@/utils/i18n"
 import { sendMessage } from "@/utils/message"
 import { ensureInitializedConfig } from "./config"
-import { getPageTranslationEnabled, setPageTranslationEnabled } from "./page-translation-state"
+import {
+  enqueuePageTranslationStateTask,
+  getPageTranslationEnabled,
+  writePageTranslationEnabled,
+} from "./page-translation-state"
 
 export const MENU_ID_TRANSLATE = "read-frog-translate"
 export const MENU_ID_SELECTION_TRANSLATE = "read-frog-selection-translate"
@@ -213,8 +217,10 @@ async function handleTranslateClick(tabId: number, tabUrl?: string) {
   const newState = !isCurrentlyTranslated
 
   if (!newState) {
-    await setPageTranslationEnabled(tabId, false, tabUrl, true)
-    void sendMessage("notifyTranslationStateChanged", { enabled: false }, tabId)
+    await enqueuePageTranslationStateTask(tabId, async () => {
+      await writePageTranslationEnabled(tabId, false, tabUrl, true)
+      void sendMessage("notifyTranslationStateChanged", { enabled: false }, tabId)
+    })
   }
 
   // Notify content script in that specific tab

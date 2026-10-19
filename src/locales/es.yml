@@ -601,6 +601,8 @@ options:
       description: Elige la acción al hacer clic en el botón flotante
       panel: Abrir panel lateral
       translate: Alternar traducción de página
+      translateOtherMode: Traducir en el otro modo
+      translateOtherModeDescription: Traduce la página actual en el modo opuesto al preferido sin cambiar la preferencia; vuelve a hacer clic para desactivar la traducción.
     closeMenu:
       disableForSite: Desactivar para este sitio
       disableGlobally: Desactivar globalmente

@@ -185,6 +185,18 @@ export default function FloatingButton() {
   }, [isFullscreen, setIsDraggingButton])
 
   const handleFloatingButtonClick = () => {
+    if (floatingButton.clickAction === "translateOtherMode") {
+      // The top-frame manager decides start / switch / stop against the saved
+      // preference; nothing is written to the config.
+      void sendMessage("toggleOtherModePageTranslationOnContentScript", {
+        analyticsContext: createFeatureUsageContext(
+          ANALYTICS_FEATURE.PAGE_TRANSLATION,
+          ANALYTICS_SURFACE.FLOATING_BUTTON,
+        ),
+      })
+      return
+    }
+
     if (floatingButton.clickAction === "translate") {
       const nextEnabled = !translationState.enabled
       void sendMessage("tryToSetEnablePageTranslationOnContentScript", {

@@ -1,6 +1,7 @@
 import type { LangCodeISO6393 } from "@read-frog/definitions"
 import type { ContentScriptContext } from "#imports"
 import type { Config } from "@/types/config/config"
+import type { TranslationMode } from "@/types/config/translate"
 import { storage } from "#imports"
 import { configSchema } from "@/types/config/config"
 import { CONFIG_STORAGE_KEY, DEFAULT_CONFIG } from "@/utils/constants/config"
@@ -45,19 +46,22 @@ export async function bootstrapHostContent(
 
   const cleanupPageTranslationTriggers = manager.registerPageTranslationTriggers()
 
-  // The tab-title switch applies to an already-translated page at once. Only
-  // the top frame owns the title, so iframes skip parsing every config write.
-  const cleanupTitleTranslationWatch =
-    window === window.top
-      ? storage.watch<Config>(`local:${CONFIG_STORAGE_KEY}`, (config) => {
-          const parsedConfig = configSchema.safeParse(config)
-          if (parsedConfig.success) {
-            manager.setTitleTranslationEnabled(
-              parsedConfig.data.pageTranslation.page.translateTitle,
-            )
-          }
-        })
-      : () => {}
+  // Config writes reach a running session without any page event: a temporary
+  // translationOnly session must notice a provider change even on a static page
+  // (every frame runs its own session), and the tab-title switch applies to an
+  // already-translated page at once. Only the top frame owns the title, so
+  // iframes skip parsing every config write.
+  const cleanupConfigWatch = storage.watch<Config>(`local:${CONFIG_STORAGE_KEY}`, (config) => {
+    void manager
+      .revalidateSession()
+      .catch((error) => logger.warn("Failed to revalidate page translation session", error))
+
+    if (window !== window.top) return
+    const parsedConfig = configSchema.safeParse(config)
+    if (parsedConfig.success) {
+      manager.setTitleTranslationEnabled(parsedConfig.data.pageTranslation.page.translateTitle)
+    }
+  })
 
   const cleanupTranslationShortcut = await bindTranslationShortcutKey(manager)
 
@@ -77,14 +81,26 @@ export async function bootstrapHostContent(
 
   // For late-loading iframes: check if translation is already enabled for this tab
   let translationEnabled = false
+  // The tab's temporary mode (floating button "other mode"); undefined when the
+  // saved preference applies. Reload and late iframes restore it from here,
+  // read together with the enabled flag so the two never disagree.
+  let temporaryMode: TranslationMode | undefined
+  let restoredSessionId: string | undefined
   try {
-    translationEnabled = await sendMessage("getEnablePageTranslationFromContentScript", undefined)
+    const snapshot = await sendMessage("getPageTranslationSnapshotFromContentScript", undefined)
+    translationEnabled = snapshot.enabled
+    temporaryMode = snapshot.mode
+    restoredSessionId = snapshot.sessionId
   } catch (error) {
     // Extension context may be invalidated during update, proceed without auto-start
     logger.error("Failed to check translation state:", error)
   }
   if (translationEnabled) {
-    void manager.start()
+    void manager.start(undefined, {
+      mode: temporaryMode,
+      restore: true,
+      sessionId: restoredSessionId,
+    })
   }
 
   const handleUrlChange = async (from: string, to: string) => {
@@ -92,7 +108,8 @@ export async function bootstrapHostContent(
       detectionGeneration += 1
       detectedPageLanguage = undefined
       logger.info("URL changed from", from, "to", to)
-      if (manager.isActive) {
+      // A start still awaiting its gates belongs to the page being left too.
+      if (manager.isActive || manager.isStarting) {
         if (areSamePageTranslationOrigin(from, to)) {
           // Same-document route change: keep the session and wrappers
           // mounted — the MutationObserver walks the new route's DOM as the
@@ -120,29 +137,51 @@ export async function bootstrapHostContent(
   // Listen for translation state changes from background
   const cleanupTranslationStateListener = onMessage("askManagerToTogglePageTranslation", (msg) => {
     const { enabled, analyticsContext } = msg.data
-    if (enabled === manager.isActive) return
     if (enabled) {
+      if (manager.isActive) return
       void manager.start(window === window.top ? analyticsContext : undefined)
-    } else {
+    } else if (manager.isActive || manager.isStarting) {
       // Invariant: every sender of askManagerToTogglePageTranslation with
       // enabled=false is a user surface (popup button, floating button,
       // context menu) — the auto-translation path only ever sends
-      // enabled=true — so a disable here is always user-initiated.
+      // enabled=true — so a disable here is always user-initiated. A start
+      // still awaiting its gates counts: the stop cancels it, otherwise it
+      // would activate right after the user turned translation off.
       manager.stop({ userInitiated: true })
     }
   })
+
+  // The click decision (start / switch / stop) needs the live manager state,
+  // which only the top frame owns; iframes follow its broadcast below.
+  const cleanupToggleOtherModeListener =
+    window === window.top
+      ? onMessage("askManagerToToggleOtherModePageTranslation", (msg) => {
+          void manager
+            .toggleOtherMode(msg.data?.analyticsContext)
+            .catch((error) => logger.warn("Failed to toggle other-mode page translation", error))
+        })
+      : () => {}
 
   const cleanupFrameTranslationStateListener =
     window === window.top
       ? () => {}
       : onMessage("notifyTranslationStateChanged", (msg) => {
-          const { enabled } = msg.data
-          if (enabled === manager.isActive) return
-          if (enabled) {
-            void manager.start()
-          } else {
-            manager.stop()
+          const { enabled, mode } = msg.data
+          if (!enabled) {
+            // isStarting too: a stop that only checked isActive would let an
+            // older async start activate the frame after it was told to stop.
+            if (manager.isActive || manager.isStarting) manager.stop()
+            return
           }
+          if (manager.isActive || manager.isStarting) {
+            // Already translating (or about to): only a different mode
+            // matters, and the mode follows the top frame.
+            if (manager.temporaryMode !== (mode ?? null)) {
+              void manager.start(undefined, { mode, replaceActiveSession: true })
+            }
+            return
+          }
+          void manager.start(undefined, { mode })
         })
 
   const cleanupDetectedLanguageRefreshListener =
@@ -157,11 +196,12 @@ export async function bootstrapHostContent(
     cleanupUrlListener()
     teardownNodeTranslation()
     cleanupPageTranslationTriggers()
-    cleanupTitleTranslationWatch()
+    cleanupConfigWatch()
     cleanupTranslationShortcut()
     cleanupTranslationModeShortcut()
     cleanupTranslationHubShortcut()
     cleanupTranslationStateListener()
+    cleanupToggleOtherModeListener()
     cleanupFrameTranslationStateListener()
     cleanupDetectedLanguageRefreshListener()
     window.removeEventListener("extension:URLChange", handleExtensionUrlChange)

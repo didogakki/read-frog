@@ -31,6 +31,10 @@ export function ClickActionSection() {
       value: "translate",
       label: i18n.t("options.floatingButton.clickAction.translate"),
     },
+    {
+      value: "translateOtherMode",
+      label: i18n.t("options.floatingButton.clickAction.translateOtherMode"),
+    },
   ] satisfies Array<{ value: FloatingButtonClickAction; label: string }>
 
   return (
@@ -38,7 +42,13 @@ export function ClickActionSection() {
       id="floating-button-click-action"
       title={i18n.t("options.floatingButton.clickAction.title")}
     >
-      <ConfigItem description={i18n.t("options.floatingButton.clickAction.description")}>
+      <ConfigItem
+        description={
+          floatingButton.clickAction === "translateOtherMode"
+            ? `${i18n.t("options.floatingButton.clickAction.description")} ${i18n.t("options.floatingButton.clickAction.translateOtherModeDescription")}`
+            : i18n.t("options.floatingButton.clickAction.description")
+        }
+      >
         <Select
           items={actions}
           value={floatingButton.clickAction}

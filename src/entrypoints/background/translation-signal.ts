@@ -1,6 +1,7 @@
 import type { LangCodeISO6393 } from "@read-frog/definitions"
 import type { FeatureUsageContext } from "@/types/analytics"
 import type { Config } from "@/types/config/config"
+import type { TranslationMode } from "@/types/config/translate"
 import { browser, storage } from "#imports"
 import { ANALYTICS_FEATURE, ANALYTICS_SURFACE } from "@/types/analytics"
 import { createFeatureUsageContext } from "@/utils/analytics"
@@ -10,23 +11,35 @@ import { getDetectedCodeStateKey, getTranslationStateKey } from "@/utils/constan
 import { shouldEnableAutoTranslation } from "@/utils/host/translate/auto-translation"
 import { logger } from "@/utils/logger"
 import { onMessage, sendMessage } from "@/utils/message"
+import { isTranslationOnlyBlockedByProvider } from "@/utils/providers/translation-only-gate"
 import { getPageTranslationOriginScope } from "@/utils/url"
 import {
   injectHostContentIntoCurrentTabIframesAfterNodeTranslation,
   injectHostContentIntoTabIframes,
 } from "./iframe-injection"
 import {
+  enqueuePageTranslationStateTask,
   getPageTranslationEnabled,
   getPageTranslationState,
+  forgetClosedSessions,
   isAutoTranslationSuppressed,
+  isClosedSession,
   isPageTranslationStateInUrlScope,
-  setPageTranslationEnabled,
+  isStaleSessionState,
+  rememberClosedSession,
+  writePageTranslationEnabled,
 } from "./page-translation-state"
 
-function notifyPageTranslationStateChanged(tabId: number, enabled: boolean) {
-  void sendMessage("notifyTranslationStateChanged", { enabled }, tabId).catch((error) =>
-    logger.warn("Failed to notify page translation state change", error),
-  )
+function notifyPageTranslationStateChanged(
+  tabId: number,
+  enabled: boolean,
+  mode?: TranslationMode,
+) {
+  void sendMessage(
+    "notifyTranslationStateChanged",
+    mode ? { enabled, mode } : { enabled },
+    tabId,
+  ).catch((error) => logger.warn("Failed to notify page translation state change", error))
 }
 
 function requestManagerToTogglePageTranslation(
@@ -36,6 +49,15 @@ function requestManagerToTogglePageTranslation(
 ) {
   void sendMessage("askManagerToTogglePageTranslation", { enabled, analyticsContext }, tabId).catch(
     (error) => logger.warn("Failed to ask page translation manager to toggle", error),
+  )
+}
+
+function requestManagerToToggleOtherModePageTranslation(
+  tabId: number,
+  analyticsContext?: FeatureUsageContext<"page_translation">,
+) {
+  void sendMessage("askManagerToToggleOtherModePageTranslation", { analyticsContext }, tabId).catch(
+    (error) => logger.warn("Failed to ask page translation manager to toggle other mode", error),
   )
 }
 
@@ -89,6 +111,22 @@ export function translationMessage() {
     return false
   })
 
+  onMessage("getPageTranslationSnapshotFromContentScript", async (msg) => {
+    const tabId = msg.sender?.tab?.id
+    if (typeof tabId === "number") {
+      const state = await getPageTranslationState(tabId)
+      return state?.enabled
+        ? {
+            enabled: true,
+            mode: state.mode,
+            ...(state.sessionId ? { sessionId: state.sessionId } : {}),
+          }
+        : { enabled: false }
+    }
+    logger.error("Invalid tabId in getPageTranslationSnapshotFromContentScript", msg)
+    return { enabled: false }
+  })
+
   onMessage("ensureIframeHostContentInjected", async (msg) => {
     const tabId = msg.data?.tabId ?? msg.sender?.tab?.id
     if (typeof tabId === "number") {
@@ -131,7 +169,11 @@ export function translationMessage() {
         // re-detected on every tab activation, so without this check a manual
         // "show original" would be force-overridden on the next tab switch.
         const state = await getPageTranslationState(tabId)
-        if (isAutoTranslationSuppressed(state, url)) return
+        // A provider-forced close only holds until the provider recovers.
+        const providerStillBlocked = state?.sessionInvalidated
+          ? isTranslationOnlyBlockedByProvider(config)
+          : true
+        if (isAutoTranslationSuppressed(state, url, providerStillBlocked)) return
 
         requestManagerToTogglePageTranslation(
           tabId,
@@ -171,8 +213,10 @@ export function translationMessage() {
         .get(tabId)
         .then((tab) => tab.url)
         .catch(() => undefined)
-      await setPageTranslationEnabled(tabId, false, tabUrl, true)
-      notifyPageTranslationStateChanged(tabId, false)
+      await enqueuePageTranslationStateTask(tabId, async () => {
+        await writePageTranslationEnabled(tabId, false, tabUrl, true)
+        notifyPageTranslationStateChanged(tabId, false)
+      })
     }
     requestManagerToTogglePageTranslation(tabId, enabled, analyticsContext)
   })
@@ -186,8 +230,10 @@ export function translationMessage() {
         tabId,
       })
       if (!enabled) {
-        await setPageTranslationEnabled(tabId, false, msg.sender?.tab?.url, true)
-        notifyPageTranslationStateChanged(tabId, false)
+        await enqueuePageTranslationStateTask(tabId, async () => {
+          await writePageTranslationEnabled(tabId, false, msg.sender?.tab?.url, true)
+          notifyPageTranslationStateChanged(tabId, false)
+        })
       }
       requestManagerToTogglePageTranslation(tabId, enabled, analyticsContext)
     } else {
@@ -195,9 +241,18 @@ export function translationMessage() {
     }
   })
 
+  onMessage("toggleOtherModePageTranslationOnContentScript", async (msg) => {
+    const tabId = msg.sender?.tab?.id
+    if (typeof tabId === "number") {
+      requestManagerToToggleOtherModePageTranslation(tabId, msg.data?.analyticsContext)
+    } else {
+      logger.error("tabId is not a number", msg)
+    }
+  })
+
   onMessage("setAndNotifyPageTranslationStateChangedByManager", async (msg) => {
     const tabId = msg.sender?.tab?.id
-    const { enabled, url, userInitiated } = msg.data
+    const { enabled, url, userInitiated, mode, sessionInvalidated, sessionId } = msg.data
     if (typeof tabId === "number") {
       const senderFrameId = msg.sender?.frameId
 
@@ -207,16 +262,47 @@ export function translationMessage() {
         // scoped to the top-frame origin and iframe echoes carry iframe URLs.
         // Only re-broadcast when the echo agrees with the stored state, so an
         // iframe-only stop cannot make the UI contradict a still-translating
-        // top frame.
-        const currentEnabled = await getPageTranslationEnabled(tabId)
-        if (enabled !== currentEnabled) return
+        // top frame. An echo from a stale mode (iframe lagging a mode switch)
+        // is dropped for the same reason.
+        // Queued behind pending writes so the read and its broadcast see one
+        // consistent state.
+        await enqueuePageTranslationStateTask(tabId, async () => {
+          const currentState = await getPageTranslationState(tabId)
+          const currentEnabled = currentState?.enabled ?? false
+          if (enabled !== currentEnabled) return
+          if (enabled && mode !== currentState?.mode) return
 
-        notifyPageTranslationStateChanged(tabId, currentEnabled)
+          notifyPageTranslationStateChanged(tabId, currentEnabled, currentState?.mode)
+        })
         return
       }
 
-      await setPageTranslationEnabled(tabId, enabled, url ?? msg.sender?.tab?.url, userInitiated)
-      notifyPageTranslationStateChanged(tabId, enabled)
+      await enqueuePageTranslationStateTask(tabId, async () => {
+        if (sessionId) {
+          if (enabled) {
+            // The session was already stopped by a stop that overtook this start.
+            if (isClosedSession(tabId, sessionId)) return
+          } else {
+            // A stop carrying an identity only closes that session: an older
+            // session's late stop or invalidation must not close a newer one.
+            const currentState = await getPageTranslationState(tabId)
+            if (!currentState?.enabled || currentState.sessionId !== sessionId) {
+              rememberClosedSession(tabId, sessionId)
+              return
+            }
+          }
+        }
+        await writePageTranslationEnabled(
+          tabId,
+          enabled,
+          url ?? msg.sender?.tab?.url,
+          userInitiated,
+          mode,
+          sessionInvalidated,
+          sessionId,
+        )
+        notifyPageTranslationStateChanged(tabId, enabled, enabled ? mode : undefined)
+      })
 
       if (enabled) {
         void injectHostContentIntoTabIframes(tabId)
@@ -226,6 +312,28 @@ export function translationMessage() {
     }
   })
 
+  onMessage("closeStalePageTranslationState", async (msg) => {
+    const tabId = msg.sender?.tab?.id
+    if (typeof tabId !== "number") {
+      logger.error("tabId is not a number", msg)
+      return
+    }
+    // Tab-level state belongs to the top frame; a frame's failed restore stays local.
+    if (isIframe(msg.sender?.frameId)) return
+
+    // Read, compare and write happen in one queued task: a newer start of the
+    // same mode is either written before this runs (identity mismatch) or after
+    // it finishes, never between the read and the write.
+    await enqueuePageTranslationStateTask(tabId, async () => {
+      const url = msg.data.url ?? msg.sender?.tab?.url
+      const state = await getPageTranslationState(tabId)
+      if (!isStaleSessionState(state, { ...msg.data, url })) return
+
+      await writePageTranslationEnabled(tabId, false, url, false, undefined, true)
+      notifyPageTranslationStateChanged(tabId, false)
+    })
+  })
+
   // === Helper Functions ===
   async function getTranslationState(tabId: number): Promise<boolean> {
     return await getPageTranslationEnabled(tabId)
@@ -233,7 +341,10 @@ export function translationMessage() {
 
   // === Cleanup ===
   browser.tabs.onRemoved.addListener(async (tabId) => {
-    await storage.removeItem(getTranslationStateKey(tabId))
+    await enqueuePageTranslationStateTask(tabId, async () => {
+      forgetClosedSessions(tabId)
+      await storage.removeItem(getTranslationStateKey(tabId))
+    })
     await storage.removeItem(getDetectedCodeStateKey(tabId))
   })
 
@@ -247,23 +358,27 @@ export function translationMessage() {
     // Only handle main frame navigations, not iframes
     if (details.frameId !== 0) return
 
-    const state = await getPageTranslationState(details.tabId)
-    if (!state) return
+    // Read-then-remove must not interleave with a start that writes a fresh state.
+    await enqueuePageTranslationStateTask(details.tabId, async () => {
+      const state = await getPageTranslationState(details.tabId)
+      if (!state) return
 
-    if (state.enabled) {
-      if (isPageTranslationStateInUrlScope(state, details.url)) return
+      if (state.enabled) {
+        if (isPageTranslationStateInUrlScope(state, details.url)) return
 
-      await storage.removeItem(getTranslationStateKey(details.tabId))
-      return
-    }
+        await storage.removeItem(getTranslationStateKey(details.tabId))
+        return
+      }
 
-    // A user's manual-off marker only applies to the origin it was set on;
-    // clear it once the tab commits to a different origin (or an origin-less
-    // URL like chrome://) so other sites keep auto-translating.
-    if (state.userDisabled) {
-      if (state.origin && state.origin === getPageTranslationOriginScope(details.url)) return
+      // A user's manual-off marker (or a provider-forced close) only applies to
+      // the origin it was set on; clear it once the tab commits to a different
+      // origin (or an origin-less URL like chrome://) so other sites keep
+      // auto-translating.
+      if (state.userDisabled || state.sessionInvalidated) {
+        if (state.origin && state.origin === getPageTranslationOriginScope(details.url)) return
 
-      await storage.removeItem(getTranslationStateKey(details.tabId))
-    }
+        await storage.removeItem(getTranslationStateKey(details.tabId))
+      }
+    })
   })
 }

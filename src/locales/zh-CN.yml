@@ -601,6 +601,8 @@ options:
       description: 选择点击悬浮按钮时执行的操作
       panel: 打开侧边栏
       translate: 切换页面翻译
+      translateOtherMode: 另一模式翻译
+      translateOtherModeDescription: 点击后按偏好设置的相反模式翻译当前页面，不会修改偏好设置；再次点击会关闭翻译。
     closeMenu:
       disableForSite: 当前网站禁用
       disableGlobally: 全局禁用

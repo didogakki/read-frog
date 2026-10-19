@@ -1,6 +1,7 @@
 import type { LangCodeISO6393 } from "@read-frog/definitions"
 import type { FeatureUsageContext } from "@/types/analytics"
 import type { Config } from "@/types/config/config"
+import type { TranslationMode } from "@/types/config/translate"
 import debounce from "debounce"
 import { toastManager } from "@/components/ui/base-ui/toast"
 import { ANALYTICS_FEATURE, ANALYTICS_SURFACE } from "@/types/analytics"
@@ -52,6 +53,12 @@ import {
   translateNodesBilingualMode,
   translateWalkedElement,
 } from "@/utils/host/translate/node-manipulation"
+import {
+  applyPageTranslationModeOverride,
+  applyTranslationModeToConfig,
+  getPageTranslationModeOverride,
+  setPageTranslationModeOverride,
+} from "@/utils/host/translate/page-translation-mode-override"
 import { validateTranslationConfigAndToast } from "@/utils/host/translate/translate-text"
 import { translateTextForPageTitle } from "@/utils/host/translate/translate-variants"
 import {
@@ -71,6 +78,7 @@ import {
   resolvePageTranslationProvider,
   resolvePageTranslationProviderOrNull,
 } from "@/utils/providers/provider-ref"
+import { getTranslationOnlyBlockedReason } from "@/utils/providers/translation-only-gate"
 import { removeReactShadowHost } from "@/utils/react-shadow-host/create-shadow-host"
 import { isTranslationCancelledError } from "@/utils/request/cancellation"
 import { createWorkPacer } from "@/utils/scheduler"
@@ -189,6 +197,43 @@ function layoutFitsSplitCap(box: Element): boolean {
   )
 }
 
+interface StartOptions {
+  /**
+   * Temporary mode for this session only; never written to the config.
+   * Omitted means the saved `pageTranslation.mode` preference.
+   */
+  mode?: TranslationMode
+  /**
+   * Replace the live (or still-starting) session instead of ignoring the
+   * request. The live session is torn down only once the new one has passed
+   * every gate, so a blocked switch leaves the page untouched.
+   */
+  replaceActiveSession?: boolean
+  /**
+   * The start re-applies a state the background already holds (page reload,
+   * late iframe). If its temporary mode turns out to be unusable, the top
+   * frame closes that stale state instead of leaving the tab marked enabled.
+   */
+  restore?: boolean
+  /**
+   * Identity of the session being restored (from the background snapshot).
+   * Kept as-is so the restored session stays the same one; a start without it
+   * is a new activation and gets a fresh identity.
+   */
+  sessionId?: string
+}
+
+// A correlation key for the tab's stored state, not cryptographic material; it
+// avoids getRandomUUID so state identities never consume walk ids' source.
+function createStateSessionId(): string {
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`
+}
+
+const OTHER_MODE: Record<TranslationMode, TranslationMode> = {
+  bilingual: "translationOnly",
+  translationOnly: "bilingual",
+}
+
 interface IPageTranslationManager {
   /**
    * Indicates whether the page translation is currently active
@@ -196,10 +241,39 @@ interface IPageTranslationManager {
   readonly isActive: boolean
 
   /**
+   * Whether a start() is between its guard and activation
+   */
+  readonly isStarting: boolean
+
+  /**
+   * The temporary mode of the running (or starting) session, or null when the
+   * saved preference applies.
+   */
+  readonly temporaryMode: TranslationMode | null
+
+  /**
    * Starts the automatic page translation functionality
    * Registers observers, touch triggers and set storage
    */
-  start: (analyticsContext?: FeatureUsageContext<"page_translation">) => Promise<void>
+  start: (
+    analyticsContext?: FeatureUsageContext<"page_translation">,
+    options?: StartOptions,
+  ) => Promise<void>
+
+  /**
+   * "Other mode" click: relative to the saved preference, starts (off),
+   * switches (on in the preference mode) or stops (on in the other mode).
+   * Calls are serialized so fast repeated clicks each see the previous one's
+   * effect.
+   */
+  toggleOtherMode: (analyticsContext?: FeatureUsageContext<"page_translation">) => Promise<void>
+
+  /**
+   * Re-checks a running temporary translationOnly session against the current
+   * config (config-change hook). Needed because a static page produces no
+   * intersection or mutation event that would notice the provider change.
+   */
+  revalidateSession: () => Promise<void>
 
   /**
    * Stops the automatic page translation functionality
@@ -254,6 +328,15 @@ export class PageTranslationManager implements IPageTranslationManager {
   private isPageTranslating: boolean = false
   /** Non-null while a start() is between its guard and activation; see start(). */
   private pendingStart: symbol | null = null
+  /**
+   * Temporary mode the current/starting session was asked for (null = saved
+   * preference). The mode the page actually renders in is the module override,
+   * which only flips once a session activates.
+   */
+  private sessionMode: TranslationMode | null = null
+  /** Identity of the stored tab state this manager's active session wrote. */
+  private stateSessionId: string | null = null
+  private toggleOtherModeChain: Promise<void> = Promise.resolve()
   private intersectionObserver: IntersectionObserver | null = null
   /**
    * Gates box-less units on the boxes they render through (see observeUnit).
@@ -314,12 +397,24 @@ export class PageTranslationManager implements IPageTranslationManager {
     return this.isPageTranslating
   }
 
-  async start(analyticsContext?: FeatureUsageContext<"page_translation">): Promise<void> {
-    if (this.isPageTranslating) {
+  get isStarting(): boolean {
+    return this.pendingStart !== null
+  }
+
+  get temporaryMode(): TranslationMode | null {
+    return this.sessionMode
+  }
+
+  async start(
+    analyticsContext?: FeatureUsageContext<"page_translation">,
+    options: StartOptions = {},
+  ): Promise<void> {
+    const replace = options.replaceActiveSession === true
+    if (this.isPageTranslating && !replace) {
       console.warn("PageTranslationManager is already active")
       return
     }
-    if (this.pendingStart) {
+    if (this.pendingStart && !replace) {
       console.warn("PageTranslationManager start is already pending")
       return
     }
@@ -327,32 +422,80 @@ export class PageTranslationManager implements IPageTranslationManager {
     // Claim the start slot for the whole pre-activation span: its awaits
     // (config read, availability gate) would otherwise let a second trigger
     // pass the isPageTranslating guard above and run a duplicate initial
-    // walk. stop() clears the slot to cancel a still-pending start.
+    // walk. stop() clears the slot to cancel a still-pending start; a
+    // replacing start supersedes the older token, which then bails out at its
+    // next token check.
     const startToken = Symbol("page-translation-start")
+    const previousSessionMode = this.sessionMode
     this.pendingStart = startToken
+    this.sessionMode = options.mode ?? null
+    const progress = { activated: false }
     try {
-      await this.runStart(startToken, analyticsContext)
+      await this.runStart(startToken, analyticsContext, options, progress)
     } finally {
       if (this.pendingStart === startToken) {
         this.pendingStart = null
+        if (!progress.activated) {
+          // Gated out before activation: a still-live session keeps its own
+          // mode, otherwise nothing is running and no mode applies.
+          this.sessionMode = this.isPageTranslating ? previousSessionMode : null
+        }
       }
     }
   }
 
-  private async runStart(
-    startToken: symbol,
+  toggleOtherMode(analyticsContext?: FeatureUsageContext<"page_translation">): Promise<void> {
+    const run = this.toggleOtherModeChain.then(() => this.runToggleOtherMode(analyticsContext))
+    this.toggleOtherModeChain = run.catch(() => {})
+    return run
+  }
+
+  private async runToggleOtherMode(
     analyticsContext?: FeatureUsageContext<"page_translation">,
   ): Promise<void> {
-    const trackedContext = window === window.top ? analyticsContext : undefined
-
     const config = await getLocalConfig()
-    if (this.pendingStart !== startToken) {
-      return
-    }
     if (!config) {
       console.warn("Config is not initialized")
       return
     }
+
+    // The target is the inverse of the SAVED preference, never of whichever
+    // mode happened to be active last.
+    const preferredMode = config.pageTranslation.mode
+    const targetMode = OTHER_MODE[preferredMode]
+    const isLive = this.isPageTranslating || this.pendingStart !== null
+
+    if (isLive && (this.sessionMode ?? preferredMode) === targetMode) {
+      this.stop({ userInitiated: true })
+      return
+    }
+
+    // Not awaited: the next click must be able to decide as soon as this one's
+    // intent (sessionMode / pendingStart) is recorded, not after the walk.
+    void this.start(analyticsContext, {
+      mode: targetMode,
+      replaceActiveSession: isLive,
+    }).catch((error) => logger.error("Failed to start other-mode page translation", error))
+  }
+
+  private async runStart(
+    startToken: symbol,
+    analyticsContext: FeatureUsageContext<"page_translation"> | undefined,
+    options: StartOptions,
+    progress: { activated: boolean },
+  ): Promise<void> {
+    const trackedContext = window === window.top ? analyticsContext : undefined
+    const startMode = options.mode ?? null
+
+    const rawConfig = await getLocalConfig()
+    if (this.pendingStart !== startToken) {
+      return
+    }
+    if (!rawConfig) {
+      console.warn("Config is not initialized")
+      return
+    }
+    const config = applyTranslationModeToConfig(rawConfig, startMode)
     this.titleTranslationEnabled = config.pageTranslation.page.translateTitle
 
     const requestedProviderConfig = resolvePageTranslationProviderOrNull(config)
@@ -394,6 +537,38 @@ export class PageTranslationManager implements IPageTranslationManager {
     // explicit guard for type-safety and for malformed storage snapshots.
     if (!requestedProviderConfig) return
 
+    // Entering translationOnly is blocked for providers without markup
+    // support. Refuse before anything is torn down so a blocked switch leaves
+    // the live page exactly as it was.
+    if (startMode === "translationOnly") {
+      const blockedReason = getTranslationOnlyBlockedReason(config)
+      if (blockedReason !== null) {
+        if (window === window.top) {
+          toastManager.add({ type: "info", title: blockedReason })
+          // No await sits between the token check above and here, so this
+          // start is still the newest intent; the background additionally
+          // applies the close only if the tab still holds the stale mode.
+          if (options.restore) {
+            void sendMessage("closeStalePageTranslationState", {
+              url: window.location.href,
+              staleMode: "translationOnly",
+              ...(options.sessionId ? { sessionId: options.sessionId } : {}),
+            }).catch((error) => logger.warn("Failed to close stale page translation state", error))
+          }
+        }
+        if (trackedContext) {
+          void trackFeatureUsed({
+            ...trackedContext,
+            ...providerAnalytics,
+            ...pageAnalytics(),
+            outcome: "failure",
+            failure_reason: "precheck",
+          })
+        }
+        return
+      }
+    }
+
     const availability = await checkProviderAvailability(requestedProviderConfig, "pageTranslation")
     if (this.pendingStart !== startToken) {
       return
@@ -415,22 +590,36 @@ export class PageTranslationManager implements IPageTranslationManager {
     try {
       const providerConfig = resolvePageTranslationProvider(config)
 
+      // Every gate has passed: only now is it safe to drop the session this
+      // one replaces (silently — the page stays "enabled" across the switch).
+      if (options.replaceActiveSession && this.isPageTranslating) {
+        this.stopInternal({ notify: false, keepSessionMode: true })
+        this.pendingStart = startToken
+      }
+
       // Activate before the notify round trip: once the flag is set, stop()
       // is authoritative for teardown, so a cancel arriving during any await
       // below tears the session down instead of racing a pending start. The
       // session-version checks after each await abort the rest of the setup
       // once such a teardown (or a newer session) has happened.
       this.isPageTranslating = true
+      progress.activated = true
+      setPageTranslationModeOverride(startMode)
       this.translationSessionVersion += 1
       const sessionVersion = this.translationSessionVersion
 
       beginPageTranslationSession()
       setPageTranslationSessionProviderRef(availability.providerRef)
 
+      const stateSessionId = options.sessionId ?? createStateSessionId()
+      this.stateSessionId = stateSessionId
+
       try {
         await sendMessage("setAndNotifyPageTranslationStateChangedByManager", {
           enabled: true,
           url: window.location.href,
+          ...(startMode ? { mode: startMode } : {}),
+          sessionId: stateSessionId,
         })
       } catch (error) {
         // Roll back the not-yet-visible activation locally (the notify
@@ -444,6 +633,8 @@ export class PageTranslationManager implements IPageTranslationManager {
       if (this.translationSessionVersion !== sessionVersion) {
         return
       }
+      // The provider may have changed while this start was awaiting its gates.
+      if (startMode === "translationOnly") void this.revalidateSession()
 
       const siteRule = getEffectiveSiteRule(config, window.location.href)
       if (siteRule.injectedCss) {
@@ -541,6 +732,12 @@ export class PageTranslationManager implements IPageTranslationManager {
     this.stopInternal({ notify: true, userInitiated: options?.userInitiated })
   }
 
+  async revalidateSession(): Promise<void> {
+    if (!this.isPageTranslating || getPageTranslationModeOverride() !== "translationOnly") return
+    // Reads the config and closes the session if the provider no longer fits.
+    await this.getSessionConfig()
+  }
+
   setTitleTranslationEnabled(enabled: boolean): void {
     this.titleTranslationEnabled = enabled
     if (!this.isPageTranslating) {
@@ -578,25 +775,40 @@ export class PageTranslationManager implements IPageTranslationManager {
   private stopInternal({
     notify,
     userInitiated,
+    sessionInvalidated,
+    keepSessionMode,
   }: {
     notify: boolean
     userInitiated?: boolean
+    /** Closed because the provider no longer supports the session's mode. */
+    sessionInvalidated?: boolean
+    /** A replacing start is about to re-activate with its own session mode. */
+    keepSessionMode?: boolean
   }): void {
     // Cancel a start() still awaiting its pre-activation gates: the manager
     // is not active yet, so the guard below would no-op this stop and the
     // pending start would activate translation after the user cancelled.
     this.pendingStart = null
+    if (!keepSessionMode) {
+      this.sessionMode = null
+      setPageTranslationModeOverride(null)
+    }
 
     if (!this.isPageTranslating) {
       console.warn("PageTranslationManager is already inactive")
       return
     }
 
+    const endedStateSessionId = this.stateSessionId
+    this.stateSessionId = null
+
     if (notify) {
       void sendMessage("setAndNotifyPageTranslationStateChangedByManager", {
         enabled: false,
         url: window.location.href,
         userInitiated,
+        ...(endedStateSessionId ? { sessionId: endedStateSessionId } : {}),
+        ...(sessionInvalidated ? { sessionInvalidated } : {}),
       })
     }
 
@@ -828,6 +1040,42 @@ export class PageTranslationManager implements IPageTranslationManager {
     }
   }
 
+  /**
+   * The config as the running session must see it: the temporary session mode
+   * applied over the saved one. Every read after activation goes through here
+   * (initial and dynamic nodes, mutation and retry passes), because the saved
+   * config alone would silently revert the page to the preference mode.
+   *
+   * Returns null when there is nothing to work with: no stored config (logged),
+   * the read belongs to a session that has since ended or been replaced (a late
+   * callback must not act for the new one), or the temporary translationOnly
+   * session's provider stopped supporting it. The last case closes the session:
+   * its targets were already unobserved and mutation events are dropped from
+   * here on, so skipping work would strand those nodes for good. A fresh manual
+   * start is the way back.
+   */
+  private async getSessionConfig(): Promise<Config | null> {
+    const sessionVersion = this.translationSessionVersion
+    const rawConfig = await getLocalConfig()
+    if (!rawConfig) {
+      logger.error("Global config is not initialized")
+      return null
+    }
+    if (!this.isPageTranslating || this.translationSessionVersion !== sessionVersion) return null
+
+    const config = applyPageTranslationModeOverride(rawConfig)
+    if (getPageTranslationModeOverride() !== "translationOnly") return config
+
+    const blockedReason = getTranslationOnlyBlockedReason(config)
+    if (blockedReason === null) return config
+
+    if (window === window.top) {
+      toastManager.add({ type: "info", title: blockedReason })
+    }
+    this.stopInternal({ notify: true, sessionInvalidated: true })
+    return null
+  }
+
   private async observeTopLevelParagraphs(
     container: HTMLElement,
     existingConfig?: Config,
@@ -839,11 +1087,8 @@ export class PageTranslationManager implements IPageTranslationManager {
     const walkId = this.walkId
     if (!walkId || !observer) return
 
-    const config = existingConfig ?? (await getLocalConfig())
-    if (!config) {
-      logger.error("Global config is not initialized")
-      return
-    }
+    const config = existingConfig ?? (await this.getSessionConfig())
+    if (!config) return
     if (this.walkId !== walkId) return
 
     // Skip if container has an ancestor that should not be walked into
@@ -1076,11 +1321,8 @@ export class PageTranslationManager implements IPageTranslationManager {
     void (async () => {
       // One config read per callback batch — a dense first intersection
       // can deliver hundreds of entries at once (#1881).
-      const currentConfig = await getLocalConfig()
-      if (!currentConfig) {
-        logger.error("Global config is not initialized")
-        return
-      }
+      const currentConfig = await this.getSessionConfig()
+      if (!currentConfig) return
       if (this.walkId !== walkId) return
       // One shared pacer bounds the batch's synchronous expansion work;
       // the liveness check stops paced expansion promptly if the user
@@ -1345,11 +1587,8 @@ export class PageTranslationManager implements IPageTranslationManager {
     // The observed top-level shadow child and its light-DOM ancestors can
     // also be blocked, independently of the enclosing shadow hosts.
     shadowWalkRoots.push(observationRoot)
-    const config = await getLocalConfig()
-    if (!config) {
-      logger.error("Global config is not initialized")
-      return null
-    }
+    const config = await this.getSessionConfig()
+    if (!config) return null
     if (!this.isPageTranslating || this.translationSessionVersion !== sessionVersion) return null
 
     let revealedRoot: HTMLElement | undefined
@@ -1440,11 +1679,8 @@ export class PageTranslationManager implements IPageTranslationManager {
     )
       return
 
-    const config = mutationConfig ?? (await getLocalConfig())
-    if (!config) {
-      logger.error("Global config is not initialized")
-      return
-    }
+    const config = mutationConfig ?? (await this.getSessionConfig())
+    if (!config) return
     if (!this.isPageTranslating || this.translationSessionVersion !== sessionVersion) return
 
     // A reveal can mutate an ancestor or a CSS-controlling sibling rather than
@@ -1623,7 +1859,7 @@ export class PageTranslationManager implements IPageTranslationManager {
     if (!this.isPageTranslating || this.translationSessionVersion !== sessionVersion) return
     // No pending mutation version means the source converged in the meantime.
     if (this.translatedSourceMutationVersions.get(source) === undefined) return
-    const config = await getLocalConfig()
+    const config = await this.getSessionConfig()
     if (!config) return
     if (!this.isPageTranslating || this.translationSessionVersion !== sessionVersion) return
     await this.retranslateChangedSource(source, config, sessionVersion)

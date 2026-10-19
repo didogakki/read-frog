@@ -3,6 +3,7 @@ import { storage } from "#imports"
 import { getTranslationStateKey } from "@/utils/constants/storage-keys"
 import {
   isAutoTranslationSuppressed,
+  isStaleSessionState,
   isPageTranslationStateInUrlScope,
   setPageTranslationEnabled,
 } from "../page-translation-state"
@@ -21,6 +22,70 @@ describe("setPageTranslationEnabled", () => {
 
     expect(storageSetItemMock).toHaveBeenCalledWith(getTranslationStateKey(42), {
       enabled: true,
+      origin: "https://example.com",
+    })
+  })
+
+  it("stores the temporary mode only on enable, scoped to the same origin", async () => {
+    await setPageTranslationEnabled(
+      42,
+      true,
+      "https://example.com/articles/1",
+      undefined,
+      "translationOnly",
+    )
+
+    expect(storageSetItemMock).toHaveBeenCalledWith(getTranslationStateKey(42), {
+      enabled: true,
+      origin: "https://example.com",
+      mode: "translationOnly",
+    })
+  })
+
+  it("never stores a mode on disable", async () => {
+    await setPageTranslationEnabled(
+      42,
+      false,
+      "https://example.com/articles/1",
+      true,
+      "translationOnly",
+    )
+
+    expect(storageSetItemMock).toHaveBeenCalledWith(getTranslationStateKey(42), {
+      enabled: false,
+      userDisabled: true,
+      origin: "https://example.com",
+    })
+  })
+
+  it("stores the session identity only on enable", async () => {
+    await setPageTranslationEnabled(
+      42,
+      true,
+      "https://example.com/articles/1",
+      undefined,
+      undefined,
+      undefined,
+      "session-a",
+    )
+    await setPageTranslationEnabled(
+      42,
+      false,
+      "https://example.com/articles/1",
+      true,
+      undefined,
+      undefined,
+      "session-a",
+    )
+
+    expect(storageSetItemMock).toHaveBeenNthCalledWith(1, getTranslationStateKey(42), {
+      enabled: true,
+      origin: "https://example.com",
+      sessionId: "session-a",
+    })
+    expect(storageSetItemMock).toHaveBeenNthCalledWith(2, getTranslationStateKey(42), {
+      enabled: false,
+      userDisabled: true,
       origin: "https://example.com",
     })
   })
@@ -87,6 +152,95 @@ describe("isAutoTranslationSuppressed", () => {
   it("does not suppress without state or URL", () => {
     expect(isAutoTranslationSuppressed(null, "https://example.com/a")).toBe(false)
     expect(isAutoTranslationSuppressed(userDisabledState, undefined)).toBe(false)
+  })
+})
+
+describe("provider-forced close marker", () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+    storage.setItem = storageSetItemMock
+    storageSetItemMock.mockResolvedValue(undefined)
+  })
+
+  const invalidatedState = {
+    enabled: false,
+    sessionInvalidated: true,
+    origin: "https://example.com",
+  }
+
+  it("is written as its own marker, never as a user refusal", async () => {
+    await setPageTranslationEnabled(
+      42,
+      false,
+      "https://example.com/articles/1",
+      undefined,
+      undefined,
+      true,
+    )
+
+    expect(storageSetItemMock).toHaveBeenCalledWith(getTranslationStateKey(42), invalidatedState)
+  })
+
+  it("lets a user refusal win over the marker", async () => {
+    await setPageTranslationEnabled(
+      42,
+      false,
+      "https://example.com/articles/1",
+      true,
+      undefined,
+      true,
+    )
+
+    expect(storageSetItemMock).toHaveBeenCalledWith(getTranslationStateKey(42), {
+      enabled: false,
+      userDisabled: true,
+      origin: "https://example.com",
+    })
+  })
+
+  it("suppresses auto-translation on its origin only while the provider stays unsupported", () => {
+    expect(isAutoTranslationSuppressed(invalidatedState, "https://example.com/a")).toBe(true)
+    expect(isAutoTranslationSuppressed(invalidatedState, "https://example.com/a", false)).toBe(
+      false,
+    )
+    expect(isAutoTranslationSuppressed(invalidatedState, "https://other.example.net/a")).toBe(false)
+  })
+})
+
+describe("isStaleSessionState", () => {
+  const state = {
+    enabled: true,
+    origin: "https://example.com",
+    mode: "translationOnly" as const,
+    sessionId: "session-a",
+  }
+  const request = { url: "https://example.com/a", staleMode: "translationOnly" as const }
+
+  it("matches only the same identity, mode and origin", () => {
+    expect(isStaleSessionState(state, { ...request, sessionId: "session-a" })).toBe(true)
+    expect(isStaleSessionState(state, { ...request, sessionId: "session-b" })).toBe(false)
+    expect(
+      isStaleSessionState(state, {
+        url: "https://other.example.net/",
+        staleMode: "translationOnly",
+      }),
+    ).toBe(false)
+    expect(isStaleSessionState({ ...state, mode: undefined }, request)).toBe(false)
+    expect(isStaleSessionState({ ...state, enabled: false }, request)).toBe(false)
+  })
+
+  it("lets a request without identity close only a state without one", () => {
+    expect(isStaleSessionState({ ...state, sessionId: undefined }, request)).toBe(true)
+    expect(isStaleSessionState(state, request)).toBe(false)
+  })
+
+  it("rejects a request naming a session when the stored state has none", () => {
+    expect(
+      isStaleSessionState(
+        { ...state, sessionId: undefined },
+        { ...request, sessionId: "session-a" },
+      ),
+    ).toBe(false)
   })
 })
 

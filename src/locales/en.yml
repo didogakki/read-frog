@@ -601,6 +601,8 @@ options:
       description: Choose the action when clicking the floating button
       panel: Open side panel
       translate: Toggle page translation
+      translateOtherMode: Translate in other mode
+      translateOtherModeDescription: Translates the current page in the opposite of your preferred mode without changing the preference; click again to turn translation off.
     closeMenu:
       disableForSite: Disable for this site
       disableGlobally: Disable globally

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import { browser, storage } from "#imports"
-import { CONFIG_STORAGE_KEY, DEFAULT_DETECTED_CODE } from "@/utils/constants/config"
+import { CONFIG_STORAGE_KEY, DEFAULT_CONFIG, DEFAULT_DETECTED_CODE } from "@/utils/constants/config"
+import { GOOGLE_TRANSLATE_PROVIDER_ID } from "@/utils/constants/providers"
 import { getDetectedCodeStateKey, getTranslationStateKey } from "@/utils/constants/storage-keys"
 
 const sendMessageMock = vi.fn<(...args: any[]) => any>()
@@ -163,6 +164,186 @@ describe("translationMessage", () => {
       42,
     )
     expect(injectHostContentIntoTabIframesMock).not.toHaveBeenCalled()
+  })
+
+  it("persists the temporary mode with the enabled state and broadcasts it", async () => {
+    await setupSubject()
+
+    await getHandler("setAndNotifyPageTranslationStateChangedByManager")({
+      data: { enabled: true, url: "https://example.com/articles/1", mode: "translationOnly" },
+      sender: { tab: { id: 42 }, frameId: 0 },
+    })
+
+    expect(storageSetItemMock).toHaveBeenCalledWith(getTranslationStateKey(42), {
+      enabled: true,
+      origin: "https://example.com",
+      mode: "translationOnly",
+    })
+    expect(sendMessageMock).toHaveBeenCalledWith(
+      "notifyTranslationStateChanged",
+      { enabled: true, mode: "translationOnly" },
+      42,
+    )
+  })
+
+  it("does not carry an earlier temporary mode into a start that uses the saved preference", async () => {
+    await setupSubject()
+    storageGetItemMock.mockResolvedValue({
+      enabled: true,
+      origin: "https://example.com",
+      mode: "translationOnly",
+    })
+
+    await getHandler("setAndNotifyPageTranslationStateChangedByManager")({
+      data: { enabled: true, url: "https://example.com/articles/1" },
+      sender: { tab: { id: 42 }, frameId: 0 },
+    })
+
+    expect(storageSetItemMock).toHaveBeenCalledWith(getTranslationStateKey(42), {
+      enabled: true,
+      origin: "https://example.com",
+    })
+    expect(sendMessageMock).toHaveBeenCalledWith(
+      "notifyTranslationStateChanged",
+      { enabled: true },
+      42,
+    )
+  })
+
+  it("drops the temporary mode and records the refusal when the manager stops on user request", async () => {
+    await setupSubject()
+    storageGetItemMock.mockResolvedValue({
+      enabled: true,
+      origin: "https://example.com",
+      mode: "translationOnly",
+    })
+
+    await getHandler("setAndNotifyPageTranslationStateChangedByManager")({
+      data: { enabled: false, url: "https://example.com/articles/1", userInitiated: true },
+      sender: { tab: { id: 42 }, frameId: 0 },
+    })
+
+    expect(storageSetItemMock).toHaveBeenCalledWith(getTranslationStateKey(42), {
+      enabled: false,
+      userDisabled: true,
+      origin: "https://example.com",
+    })
+    expect(sendMessageMock).toHaveBeenCalledWith(
+      "notifyTranslationStateChanged",
+      { enabled: false },
+      42,
+    )
+  })
+
+  it("re-broadcasts an iframe echo only when it carries the tab's current mode", async () => {
+    await setupSubject()
+    storageGetItemMock.mockResolvedValue({
+      enabled: true,
+      origin: "https://example.com",
+      mode: "translationOnly",
+    })
+
+    await getHandler("setAndNotifyPageTranslationStateChangedByManager")({
+      data: { enabled: true, url: "https://embed.example.net/frame", mode: "translationOnly" },
+      sender: { tab: { id: 42 }, frameId: 7 },
+    })
+
+    expect(storageSetItemMock).not.toHaveBeenCalled()
+    expect(sendMessageMock).toHaveBeenCalledWith(
+      "notifyTranslationStateChanged",
+      { enabled: true, mode: "translationOnly" },
+      42,
+    )
+  })
+
+  it("drops a stale iframe echo from a different mode instead of contradicting the top frame", async () => {
+    await setupSubject()
+    storageGetItemMock.mockResolvedValue({
+      enabled: true,
+      origin: "https://example.com",
+      mode: "translationOnly",
+    })
+
+    // The iframe is still reporting the preference mode it was started in.
+    await getHandler("setAndNotifyPageTranslationStateChangedByManager")({
+      data: { enabled: true, url: "https://embed.example.net/frame" },
+      sender: { tab: { id: 42 }, frameId: 7 },
+    })
+
+    expect(storageSetItemMock).not.toHaveBeenCalled()
+    expect(sendMessageMock).not.toHaveBeenCalledWith(
+      "notifyTranslationStateChanged",
+      expect.anything(),
+      42,
+    )
+  })
+
+  it("drops an iframe echo for the preference mode while the tab runs a temporary mode", async () => {
+    await setupSubject()
+    storageGetItemMock.mockResolvedValue({ enabled: true, origin: "https://example.com" })
+
+    await getHandler("setAndNotifyPageTranslationStateChangedByManager")({
+      data: { enabled: true, url: "https://embed.example.net/frame", mode: "translationOnly" },
+      sender: { tab: { id: 42 }, frameId: 7 },
+    })
+
+    expect(sendMessageMock).not.toHaveBeenCalledWith(
+      "notifyTranslationStateChanged",
+      expect.anything(),
+      42,
+    )
+  })
+
+  it("hands content scripts the tab's enabled flag and temporary mode as one snapshot", async () => {
+    await setupSubject()
+    const getSnapshot = getHandler("getPageTranslationSnapshotFromContentScript")
+
+    storageGetItemMock.mockResolvedValue({
+      enabled: true,
+      origin: "https://example.com",
+      mode: "translationOnly",
+    })
+    await expect(getSnapshot({ sender: { tab: { id: 42 }, frameId: 3 } })).resolves.toEqual({
+      enabled: true,
+      mode: "translationOnly",
+    })
+
+    storageGetItemMock.mockResolvedValue({ enabled: true, origin: "https://example.com" })
+    await expect(getSnapshot({ sender: { tab: { id: 42 } } })).resolves.toEqual({
+      enabled: true,
+      mode: undefined,
+    })
+
+    // A mode left on a disabled record is never reported as live.
+    storageGetItemMock.mockResolvedValue({ enabled: false, mode: "translationOnly" })
+    await expect(getSnapshot({ sender: { tab: { id: 42 } } })).resolves.toEqual({
+      enabled: false,
+    })
+
+    await expect(getSnapshot({ sender: {} })).resolves.toEqual({ enabled: false })
+  })
+
+  it("forwards the other-mode click to the sender's tab without touching stored state", async () => {
+    await setupSubject()
+    const analyticsContext = { feature: "page_translation", surface: "floating_button" }
+
+    await getHandler("toggleOtherModePageTranslationOnContentScript")({
+      data: { analyticsContext },
+      sender: { tab: { id: 42 }, frameId: 0 },
+    })
+
+    expect(sendMessageMock).toHaveBeenCalledWith(
+      "askManagerToToggleOtherModePageTranslation",
+      { analyticsContext },
+      42,
+    )
+    // The manager decides; the background must not pre-write enabled/userDisabled.
+    expect(storageSetItemMock).not.toHaveBeenCalled()
+    expect(sendMessageMock).not.toHaveBeenCalledWith(
+      "askManagerToTogglePageTranslation",
+      expect.anything(),
+      expect.anything(),
+    )
   })
 
   it("clears state immediately when a tab-level request disables page translation", async () => {
@@ -680,6 +861,497 @@ describe("translationMessage", () => {
       })
 
       expect(storageRemoveItemMock).not.toHaveBeenCalled()
+    })
+  })
+
+  describe("provider-forced close of a temporary translationOnly session", () => {
+    const INVALIDATED_STATE = {
+      enabled: false,
+      sessionInvalidated: true,
+      origin: "https://example.com",
+    }
+
+    function mockConfigAndState(state: unknown, providerId: string) {
+      storageGetItemMock.mockImplementation(async (key: string) => {
+        if (key === `local:${CONFIG_STORAGE_KEY}`) {
+          return {
+            ...DEFAULT_CONFIG,
+            pageTranslation: { ...DEFAULT_CONFIG.pageTranslation, providerId },
+          }
+        }
+        if (key === getTranslationStateKey(42)) return state
+        return undefined
+      })
+    }
+
+    it("records the close without faking a user refusal", async () => {
+      await setupSubject()
+
+      await getHandler("setAndNotifyPageTranslationStateChangedByManager")({
+        data: { enabled: false, url: "https://example.com/articles/1", sessionInvalidated: true },
+        sender: { tab: { id: 42 }, frameId: 0 },
+      })
+
+      expect(storageSetItemMock).toHaveBeenCalledWith(getTranslationStateKey(42), INVALIDATED_STATE)
+      expect(sendMessageMock).toHaveBeenCalledWith(
+        "notifyTranslationStateChanged",
+        { enabled: false },
+        42,
+      )
+    })
+
+    it("holds auto-translation back on that origin while the provider is still unsupported", async () => {
+      await setupSubject()
+      shouldEnableAutoTranslationMock.mockResolvedValue(true)
+      mockConfigAndState(INVALIDATED_STATE, DEFAULT_CONFIG.pageTranslation.providerId)
+
+      await getHandler("reportDetectedPageLanguage")({
+        data: { detectedCodeOrUnd: "eng", url: "https://example.com/articles/2" },
+        sender: { tab: { id: 42 }, frameId: 0 },
+      })
+
+      expect(sendMessageMock).not.toHaveBeenCalledWith(
+        "askManagerToTogglePageTranslation",
+        expect.objectContaining({ enabled: true }),
+        42,
+      )
+    })
+
+    it("lets auto-translation resume once the provider supports translationOnly again", async () => {
+      await setupSubject()
+      shouldEnableAutoTranslationMock.mockResolvedValue(true)
+      mockConfigAndState(INVALIDATED_STATE, GOOGLE_TRANSLATE_PROVIDER_ID)
+
+      await getHandler("reportDetectedPageLanguage")({
+        data: { detectedCodeOrUnd: "eng", url: "https://example.com/articles/2" },
+        sender: { tab: { id: 42 }, frameId: 0 },
+      })
+
+      expect(sendMessageMock).toHaveBeenCalledWith(
+        "askManagerToTogglePageTranslation",
+        expect.objectContaining({ enabled: true }),
+        42,
+      )
+    })
+
+    it("does not hold auto-translation back on other origins", async () => {
+      await setupSubject()
+      shouldEnableAutoTranslationMock.mockResolvedValue(true)
+      mockConfigAndState(INVALIDATED_STATE, DEFAULT_CONFIG.pageTranslation.providerId)
+
+      await getHandler("reportDetectedPageLanguage")({
+        data: { detectedCodeOrUnd: "eng", url: "https://other.example.net/page" },
+        sender: { tab: { id: 42 }, frameId: 0 },
+      })
+
+      expect(sendMessageMock).toHaveBeenCalledWith(
+        "askManagerToTogglePageTranslation",
+        expect.objectContaining({ enabled: true }),
+        42,
+      )
+    })
+
+    it("is replaced by an explicit start, which carries no marker", async () => {
+      await setupSubject()
+      storageGetItemMock.mockResolvedValue(INVALIDATED_STATE)
+
+      await getHandler("setAndNotifyPageTranslationStateChangedByManager")({
+        data: { enabled: true, url: "https://example.com/articles/1" },
+        sender: { tab: { id: 42 }, frameId: 0 },
+      })
+
+      expect(storageSetItemMock).toHaveBeenCalledWith(getTranslationStateKey(42), {
+        enabled: true,
+        origin: "https://example.com",
+      })
+    })
+
+    it("keeps the marker on same-origin navigation and clears it when the tab leaves", async () => {
+      await setupSubject()
+      storageGetItemMock.mockResolvedValue(INVALIDATED_STATE)
+
+      await getOnCommittedListener()({
+        tabId: 42,
+        frameId: 0,
+        url: "https://example.com/articles/3",
+      })
+      expect(storageRemoveItemMock).not.toHaveBeenCalled()
+
+      await getOnCommittedListener()({
+        tabId: 42,
+        frameId: 0,
+        url: "https://other.example.net/page",
+      })
+      expect(storageRemoveItemMock).toHaveBeenCalledWith(getTranslationStateKey(42))
+    })
+  })
+
+  describe("closing a stale restored state", () => {
+    const STALE_STATE = {
+      enabled: true,
+      origin: "https://example.com",
+      mode: "translationOnly",
+    }
+    const close = (frameId: number | undefined = 0) =>
+      getHandler("closeStalePageTranslationState")({
+        data: { url: "https://example.com/articles/1", staleMode: "translationOnly" },
+        sender: { tab: { id: 42 }, frameId },
+      })
+
+    it("clears enabled and mode in one write and broadcasts disabled", async () => {
+      await setupSubject()
+      storageGetItemMock.mockResolvedValue(STALE_STATE)
+
+      await close()
+
+      expect(storageSetItemMock).toHaveBeenCalledTimes(1)
+      expect(storageSetItemMock).toHaveBeenCalledWith(getTranslationStateKey(42), {
+        enabled: false,
+        sessionInvalidated: true,
+        origin: "https://example.com",
+      })
+      expect(sendMessageMock).toHaveBeenCalledWith(
+        "notifyTranslationStateChanged",
+        { enabled: false },
+        42,
+      )
+    })
+
+    it("does not clear a newer start that already replaced the stale mode", async () => {
+      await setupSubject()
+
+      // The user restarted in the saved preference (no mode) before the late failure arrived.
+      storageGetItemMock.mockResolvedValue({ enabled: true, origin: "https://example.com" })
+      await close()
+      // ...or already turned translation off themselves.
+      storageGetItemMock.mockResolvedValue({
+        enabled: false,
+        userDisabled: true,
+        origin: "https://example.com",
+      })
+      await close()
+
+      expect(storageSetItemMock).not.toHaveBeenCalled()
+      expect(sendMessageMock).not.toHaveBeenCalled()
+    })
+
+    it("ignores a frame's failed restore: it cannot write top-level state", async () => {
+      await setupSubject()
+      storageGetItemMock.mockResolvedValue(STALE_STATE)
+
+      await close(7)
+
+      expect(storageSetItemMock).not.toHaveBeenCalled()
+      expect(sendMessageMock).not.toHaveBeenCalled()
+    })
+
+    describe("session identity", () => {
+      // Closed-session memory is module state that outlives a single test.
+      beforeEach(async () => {
+        const { forgetClosedSessions } = await import("../page-translation-state")
+        forgetClosedSessions(42)
+      })
+
+      const enable = (sessionId: string, frameId = 0) =>
+        getHandler("setAndNotifyPageTranslationStateChangedByManager")({
+          data: {
+            enabled: true,
+            url: "https://example.com/articles/1",
+            mode: "translationOnly",
+            sessionId,
+          },
+          sender: { tab: { id: 42 }, frameId },
+        })
+      const closeSession = (sessionId?: string) =>
+        getHandler("closeStalePageTranslationState")({
+          data: {
+            url: "https://example.com/articles/1",
+            staleMode: "translationOnly",
+            ...(sessionId ? { sessionId } : {}),
+          },
+          sender: { tab: { id: 42 }, frameId: 0 },
+        })
+
+      function createDeferred() {
+        let resolve!: () => void
+        const promise = new Promise<void>((r) => {
+          resolve = r
+        })
+        return { promise, resolve }
+      }
+
+      /** In-memory tab state whose next read / the next matching write can be held open. */
+      function useMemoryStore(initial?: unknown) {
+        const key = getTranslationStateKey(42)
+        const store = new Map<string, unknown>(initial ? [[key, initial]] : [])
+        const gates: {
+          read?: Promise<void>
+          write?: { when: (value: any) => boolean; until: Promise<void> }
+        } = {}
+        const writes: unknown[] = []
+        storageGetItemMock.mockImplementation(async (k: string) => {
+          const gate = gates.read
+          gates.read = undefined
+          await gate
+          return store.get(k)
+        })
+        storageSetItemMock.mockImplementation(async (k: string, value: unknown) => {
+          const gate = gates.write
+          if (gate?.when(value)) {
+            gates.write = undefined
+            await gate.until
+          }
+          store.set(k, value)
+          writes.push(value)
+        })
+        return { read: () => store.get(key), gates, writes }
+      }
+
+      it("stores the identity with the enabled state and hands it to a restoring frame", async () => {
+        await setupSubject()
+        const memory = useMemoryStore()
+
+        await enable("session-a")
+
+        expect(memory.read()).toEqual({
+          enabled: true,
+          origin: "https://example.com",
+          mode: "translationOnly",
+          sessionId: "session-a",
+        })
+        await expect(
+          getHandler("getPageTranslationSnapshotFromContentScript")({
+            sender: { tab: { id: 42 }, frameId: 0 },
+          }),
+        ).resolves.toEqual({ enabled: true, mode: "translationOnly", sessionId: "session-a" })
+      })
+
+      it("ignores a late close from an old session after a same-mode restart", async () => {
+        await setupSubject()
+        const memory = useMemoryStore()
+
+        await enable("session-a")
+        await enable("session-b")
+        sendMessageMock.mockClear()
+        await closeSession("session-a")
+
+        expect(memory.read()).toMatchObject({ enabled: true, sessionId: "session-b" })
+        expect(memory.writes).toHaveLength(2)
+        expect(sendMessageMock).not.toHaveBeenCalled()
+      })
+
+      it("closes the very session it was issued for", async () => {
+        await setupSubject()
+        const memory = useMemoryStore()
+
+        await enable("session-a")
+        await closeSession("session-a")
+
+        expect(memory.read()).toEqual({
+          enabled: false,
+          sessionInvalidated: true,
+          origin: "https://example.com",
+        })
+      })
+
+      it("a close without identity closes a legacy state but never a newer identified session", async () => {
+        await setupSubject()
+        const memory = useMemoryStore({
+          enabled: true,
+          origin: "https://example.com",
+          mode: "translationOnly",
+        })
+
+        await closeSession()
+        expect(memory.read()).toMatchObject({ enabled: false, sessionInvalidated: true })
+
+        await enable("session-a")
+        sendMessageMock.mockClear()
+        await closeSession()
+
+        expect(memory.read()).toMatchObject({ enabled: true, sessionId: "session-a" })
+        expect(sendMessageMock).not.toHaveBeenCalled()
+      })
+
+      it("ignores a close from another origin", async () => {
+        await setupSubject()
+        const memory = useMemoryStore()
+
+        await enable("session-a")
+        await getHandler("closeStalePageTranslationState")({
+          data: {
+            url: "https://other.example.net/page",
+            staleMode: "translationOnly",
+            sessionId: "session-a",
+          },
+          sender: { tab: { id: 42 }, frameId: 0 },
+        })
+
+        expect(memory.read()).toMatchObject({ enabled: true, sessionId: "session-a" })
+      })
+
+      it("a same-mode start landing between the close's read and write is not overwritten", async () => {
+        await setupSubject()
+        const memory = useMemoryStore({
+          enabled: true,
+          origin: "https://example.com",
+          mode: "translationOnly",
+          sessionId: "session-a",
+        })
+        const releaseRead = createDeferred()
+        const releaseWrite = createDeferred()
+        memory.gates.read = releaseRead.promise
+        // Only the close's own write (the disable) is held open.
+        memory.gates.write = {
+          when: (value) => value.enabled === false,
+          until: releaseWrite.promise,
+        }
+
+        // The close has been dispatched and is parked on its storage read...
+        const closing = closeSession("session-a")
+        await Promise.resolve()
+        // ...when the newer same-mode session announces itself.
+        const starting = enable("session-b")
+        releaseRead.resolve()
+        await new Promise((resolve) => setTimeout(resolve, 0))
+        // ...and the close's own write is still in flight.
+        releaseWrite.resolve()
+        await Promise.all([closing, starting])
+
+        expect(memory.read()).toEqual({
+          enabled: true,
+          origin: "https://example.com",
+          mode: "translationOnly",
+          sessionId: "session-b",
+        })
+        expect(memory.writes.at(-1)).toMatchObject({ enabled: true, sessionId: "session-b" })
+        // The UI heard "disabled" for the old session before "enabled" for the new one.
+        const notified = sendMessageMock.mock.calls
+          .filter(([name]) => name === "notifyTranslationStateChanged")
+          .map(([, data]) => data.enabled)
+        expect(notified).toEqual([false, true])
+      })
+
+      it("a user disable cannot be overwritten by an earlier, slower enable write", async () => {
+        await setupSubject()
+        const memory = useMemoryStore()
+        const releaseWrite = createDeferred()
+        // Only the enable write is slow; the disable would otherwise land first.
+        memory.gates.write = {
+          when: (value) => value.enabled === true,
+          until: releaseWrite.promise,
+        }
+
+        const starting = enable("session-a")
+        await Promise.resolve()
+        const disabling = getHandler("tryToSetEnablePageTranslationOnContentScript")({
+          data: { enabled: false },
+          sender: { tab: { id: 42, url: "https://example.com/articles/1" }, frameId: 0 },
+        })
+        releaseWrite.resolve()
+        await Promise.all([starting, disabling])
+
+        expect(memory.read()).toEqual({
+          enabled: false,
+          userDisabled: true,
+          origin: "https://example.com",
+        })
+      })
+
+      const stop = (sessionId?: string, extra: Record<string, unknown> = {}) =>
+        getHandler("setAndNotifyPageTranslationStateChangedByManager")({
+          data: {
+            enabled: false,
+            url: "https://example.com/articles/1",
+            ...(sessionId ? { sessionId } : {}),
+            ...extra,
+          },
+          sender: { tab: { id: 42 }, frameId: 0 },
+        })
+      const notifiedStates = () =>
+        sendMessageMock.mock.calls
+          .filter(([name]) => name === "notifyTranslationStateChanged")
+          .map(([, data]) => data.enabled)
+
+      it("ignores an older session's delayed stop after a newer same-mode start", async () => {
+        await setupSubject()
+        const memory = useMemoryStore()
+
+        await enable("session-a")
+        await enable("session-b")
+        sendMessageMock.mockClear()
+        await stop("session-a")
+        await stop("session-a", { sessionInvalidated: true })
+
+        expect(memory.read()).toMatchObject({ enabled: true, sessionId: "session-b" })
+        expect(memory.writes).toHaveLength(2)
+        expect(notifiedStates()).toEqual([])
+
+        await stop("session-b")
+        expect(memory.read()).toEqual({ enabled: false })
+        expect(notifiedStates()).toEqual([false])
+      })
+
+      it("still lets a disable without identity close the current session", async () => {
+        await setupSubject()
+        const memory = useMemoryStore()
+
+        await enable("session-a")
+        await stop(undefined, { userInitiated: true })
+
+        expect(memory.read()).toEqual({
+          enabled: false,
+          userDisabled: true,
+          origin: "https://example.com",
+        })
+      })
+
+      it("a stop queued behind a slow start of its own session wins", async () => {
+        await setupSubject()
+        const memory = useMemoryStore()
+        const releaseWrite = createDeferred()
+        memory.gates.write = {
+          when: (value) => value.enabled === true,
+          until: releaseWrite.promise,
+        }
+
+        const starting = enable("session-a")
+        await Promise.resolve()
+        const stopping = stop("session-a")
+        releaseWrite.resolve()
+        await Promise.all([starting, stopping])
+
+        expect(memory.read()).toEqual({ enabled: false })
+        expect(notifiedStates()).toEqual([true, false])
+      })
+
+      it("a cancelled start whose enable arrives after its stop cannot resurrect state", async () => {
+        await setupSubject()
+        const memory = useMemoryStore()
+
+        await stop("session-a")
+        await enable("session-a")
+        expect(memory.read()).toBeUndefined()
+        expect(notifiedStates()).toEqual([])
+
+        // The newer intent still applies, and the cancelled one stays cancelled.
+        await enable("session-b")
+        await enable("session-a")
+        expect(memory.read()).toMatchObject({ enabled: true, sessionId: "session-b" })
+        expect(notifiedStates()).toEqual([true])
+      })
+
+      it("an iframe echo never writes state", async () => {
+        await setupSubject()
+        const memory = useMemoryStore()
+
+        await enable("session-a")
+        const writesBefore = memory.writes.length
+        await enable("iframe-session", 7)
+
+        expect(memory.writes).toHaveLength(writesBefore)
+        expect(memory.read()).toMatchObject({ sessionId: "session-a" })
+      })
     })
   })
 })

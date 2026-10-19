@@ -601,6 +601,8 @@ options:
       description: 選擇點選懸浮按鈕時執行的操作
       panel: 開啟側邊欄
       translate: 切換頁面翻譯
+      translateOtherMode: 另一模式翻譯
+      translateOtherModeDescription: 點選後會以偏好設定的相反模式翻譯目前頁面，不會修改偏好設定；再次點選會關閉翻譯。
     closeMenu:
       disableForSite: 停用此網站
       disableGlobally: 全域停用

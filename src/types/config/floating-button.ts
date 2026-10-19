@@ -4,7 +4,7 @@ export const floatingButtonSides = ["left", "right"] as const
 export type FloatingButtonSide = (typeof floatingButtonSides)[number]
 export const floatingButtonSideSchema = z.enum(floatingButtonSides)
 
-export const floatingButtonClickActions = ["panel", "translate"] as const
+export const floatingButtonClickActions = ["panel", "translate", "translateOtherMode"] as const
 export type FloatingButtonClickAction = (typeof floatingButtonClickActions)[number]
 export const floatingButtonClickActionSchema = z.enum(floatingButtonClickActions)
 
